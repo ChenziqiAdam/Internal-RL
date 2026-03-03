@@ -145,6 +145,87 @@ def load_dataset(path: str) -> Dict:
         return pickle.load(f)
 
 
+def save_dataset_mmap(dataset: Dict, out_dir: str):
+    """
+    Save dataset as memory-mapped flat arrays + index file.
+    Files created:
+      obs_flat.npy   — shape (total_steps+N, obs_dim) float32
+      acts_flat.npy  — shape (total_steps,) int32
+      subgoals_flat.npy — shape (total_steps,) int32
+      index.npy      — shape (N, 2) int64, start/end offsets per episode
+      meta.npy       — pickled task_ids and tasks (stored as object array)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    obs_seqs = dataset["obs_seqs"]
+    act_seqs = dataset["action_seqs"]
+    sg_seqs = dataset["subgoal_seqs"]
+    N = len(obs_seqs)
+
+    # Build index: (start_step, end_step) for each episode (step = action index)
+    lengths = [len(a) for a in act_seqs]
+    index = np.zeros((N, 2), dtype=np.int64)
+    offset = 0
+    for i, L in enumerate(lengths):
+        index[i] = [offset, offset + L]
+        offset += L
+    total_steps = offset
+
+    obs_dim = obs_seqs[0].shape[1]
+
+    # Allocate and fill flat arrays
+    obs_flat = np.empty((total_steps + N, obs_dim), dtype=np.float32)
+    acts_flat = np.empty(total_steps, dtype=np.int32)
+    sg_flat = np.empty(total_steps, dtype=np.int32)
+
+    obs_offset = 0
+    for i, (obs, act, sg) in enumerate(zip(obs_seqs, act_seqs, sg_seqs)):
+        L = len(act)
+        # obs has T+1 entries; acts/sg have T entries
+        obs_flat[obs_offset: obs_offset + L + 1] = obs
+        acts_flat[index[i, 0]: index[i, 1]] = act
+        sg_flat[index[i, 0]: index[i, 1]] = sg
+        obs_offset += L + 1
+
+    # obs_index: (start_obs, end_obs) per episode
+    obs_index = np.zeros((N, 2), dtype=np.int64)
+    obs_off = 0
+    for i, L in enumerate(lengths):
+        obs_index[i] = [obs_off, obs_off + L + 1]
+        obs_off += L + 1
+
+    np.save(os.path.join(out_dir, "obs_flat.npy"), obs_flat)
+    np.save(os.path.join(out_dir, "acts_flat.npy"), acts_flat)
+    np.save(os.path.join(out_dir, "subgoals_flat.npy"), sg_flat)
+    np.save(os.path.join(out_dir, "index.npy"), index)           # action offsets
+    np.save(os.path.join(out_dir, "obs_index.npy"), obs_index)   # obs offsets
+    meta = {"task_ids": dataset["task_ids"], "tasks": dataset["tasks"]}
+    np.save(os.path.join(out_dir, "meta.npy"), meta, allow_pickle=True)
+    print(f"Saved mmap dataset ({N} episodes, {total_steps} steps) to {out_dir}/")
+
+
+def load_dataset_mmap(out_dir: str) -> Dict:
+    """
+    Load mmap dataset. Arrays are memory-mapped (read-only); only accessed slices
+    are paged into RAM.
+    """
+    obs_flat = np.load(os.path.join(out_dir, "obs_flat.npy"), mmap_mode="r")
+    acts_flat = np.load(os.path.join(out_dir, "acts_flat.npy"), mmap_mode="r")
+    sg_flat = np.load(os.path.join(out_dir, "subgoals_flat.npy"), mmap_mode="r")
+    index = np.load(os.path.join(out_dir, "index.npy"))
+    obs_index = np.load(os.path.join(out_dir, "obs_index.npy"))
+    meta = np.load(os.path.join(out_dir, "meta.npy"), allow_pickle=True).item()
+    return {
+        "obs_flat": obs_flat,
+        "acts_flat": acts_flat,
+        "subgoals_flat": sg_flat,
+        "index": index,
+        "obs_index": obs_index,
+        "task_ids": meta["task_ids"],
+        "tasks": meta["tasks"],
+        "_is_mmap": True,
+    }
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -156,10 +237,13 @@ if __name__ == "__main__":
 
     if args.split == "pretrain":
         tasks = PRETRAIN_TASKS
-        out = os.path.join(args.out_dir, "pretrain.pkl")
+        pkl_out = os.path.join(args.out_dir, "pretrain.pkl")
+        mmap_out = os.path.join(args.out_dir, "pretrain")
     else:
         tasks = [POSTRAIN_TASK]
-        out = os.path.join(args.out_dir, "posttrain.pkl")
+        pkl_out = os.path.join(args.out_dir, "posttrain.pkl")
+        mmap_out = os.path.join(args.out_dir, "posttrain")
 
     dataset = generate_dataset(tasks, num_episodes_per_task=args.n_episodes, seed=args.seed)
-    save_dataset(dataset, out)
+    save_dataset(dataset, pkl_out)
+    save_dataset_mmap(dataset, mmap_out)

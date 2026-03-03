@@ -4,5 +4,7 @@ PROCESS.md
 CLAUDE.md
 
 nohup.out
+data/
+checkpoints/
 
 __pycache__/

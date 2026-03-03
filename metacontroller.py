@@ -20,8 +20,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS, NUM_ACTIONS
-from train_pretrain import TrajectoryDataset, collate_fn
-from data_gen import load_dataset
+from train_pretrain import TrajectoryDataset, MmapTrajectoryDataset, BucketSampler, collate_fn
+from data_gen import load_dataset, load_dataset_mmap
 from env import OBS_DIM
 
 # Metacontroller hyperparams
@@ -281,10 +281,22 @@ def train_metacontroller(args):
 
     optimizer = torch.optim.AdamW(trainable, lr=3e-4, weight_decay=0.03)
 
-    dataset = load_dataset(args.data_path)
-    ds = TrajectoryDataset(dataset)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        collate_fn=collate_fn, drop_last=True, num_workers=2)
+    if os.path.isdir(args.data_path):
+        dataset = load_dataset_mmap(args.data_path)
+        ds = MmapTrajectoryDataset(dataset)
+        sampler = BucketSampler(ds.lengths(), batch_size=args.batch_size, drop_last=True)
+        loader = DataLoader(
+            ds, batch_sampler=sampler, collate_fn=collate_fn,
+            num_workers=2, pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        dataset = load_dataset(args.data_path)
+        ds = TrajectoryDataset(dataset)
+        loader = DataLoader(
+            ds, batch_size=args.batch_size, shuffle=True,
+            collate_fn=collate_fn, drop_last=True,
+            num_workers=2, pin_memory=torch.cuda.is_available(),
+        )
 
     os.makedirs(args.save_dir, exist_ok=True)
     step = 0

@@ -12,12 +12,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from typing import List, Optional
 import pickle
 
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS
-from data_gen import load_dataset
+from data_gen import load_dataset, load_dataset_mmap
 from env import OBS_DIM, NUM_ACTIONS
 
 
@@ -46,6 +46,78 @@ class TrajectoryDataset(Dataset):
             subgoals = subgoals[start : start + self.max_len]
 
         return obs, acts, subgoals
+
+
+class MmapTrajectoryDataset(Dataset):
+    """
+    Memory-mapped dataset. Only the requested slice is paged into RAM per __getitem__.
+    Uses torch.from_numpy() to avoid extra copies for float32 obs.
+    """
+    def __init__(self, dataset: dict, max_len: int = 200):
+        self.obs_flat = dataset["obs_flat"]       # np.memmap (total_obs, obs_dim)
+        self.acts_flat = dataset["acts_flat"]     # np.memmap (total_steps,)
+        self.sg_flat = dataset["subgoals_flat"]   # np.memmap (total_steps,)
+        self.index = dataset["index"]             # (N, 2) int64 action offsets
+        self.obs_index = dataset["obs_index"]     # (N, 2) int64 obs offsets
+        self.max_len = max_len
+        self._lengths = self.index[:, 1] - self.index[:, 0]  # episode lengths
+
+    def __len__(self):
+        return len(self.index)
+
+    def lengths(self):
+        return self._lengths
+
+    def __getitem__(self, idx):
+        a_start, a_end = self.index[idx]
+        o_start, o_end = self.obs_index[idx]
+
+        # Slice from mmap — only this region is paged in
+        obs_np = np.array(self.obs_flat[o_start:o_end], dtype=np.float32)
+        acts_np = np.array(self.acts_flat[a_start:a_end], dtype=np.int64)
+        sg_np = np.array(self.sg_flat[a_start:a_end], dtype=np.int64)
+
+        T = acts_np.shape[0]
+        if T > self.max_len:
+            start = np.random.randint(0, T - self.max_len)
+            obs_np = obs_np[start: start + self.max_len + 1]
+            acts_np = acts_np[start: start + self.max_len]
+            sg_np = sg_np[start: start + self.max_len]
+
+        # from_numpy avoids copy (obs is already float32)
+        obs = torch.from_numpy(obs_np)
+        acts = torch.from_numpy(acts_np)
+        subgoals = torch.from_numpy(sg_np)
+        return obs, acts, subgoals
+
+
+class BucketSampler(Sampler):
+    """
+    Groups indices into batches of similar sequence lengths to minimize padding.
+    Shuffles within and across buckets each epoch.
+    """
+    def __init__(self, lengths: np.ndarray, batch_size: int, drop_last: bool = True):
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        # Sort by length, then split into batches
+        self._sorted_idx = np.argsort(lengths)
+
+    def __iter__(self):
+        # Chunk sorted indices into batch_size blocks, shuffle block order, yield each block as a batch
+        idx = self._sorted_idx.copy()
+        chunks = [idx[i: i + self.batch_size] for i in range(0, len(idx), self.batch_size)]
+        np.random.shuffle(chunks)
+        for chunk in chunks:
+            if self.drop_last and len(chunk) < self.batch_size:
+                continue
+            np.random.shuffle(chunk)
+            yield chunk.tolist()
+
+    def __len__(self):
+        n = len(self._sorted_idx)
+        if self.drop_last:
+            return n // self.batch_size
+        return math.ceil(n / self.batch_size)
 
 
 def collate_fn(batch):
@@ -80,13 +152,24 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}, Seed: {args.seed}")
 
-    # Load data
-    dataset = load_dataset(args.data_path)
-    ds = TrajectoryDataset(dataset, max_len=args.max_len)
-    loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=4, drop_last=True
-    )
+    # Load data — use mmap format if data_path is a directory
+    if os.path.isdir(args.data_path):
+        dataset = load_dataset_mmap(args.data_path)
+        ds = MmapTrajectoryDataset(dataset, max_len=args.max_len)
+        sampler = BucketSampler(ds.lengths(), batch_size=args.batch_size, drop_last=True)
+        loader = DataLoader(
+            ds, batch_sampler=sampler, collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        dataset = load_dataset(args.data_path)
+        ds = TrajectoryDataset(dataset, max_len=args.max_len)
+        loader = DataLoader(
+            ds, batch_size=args.batch_size, shuffle=True,
+            collate_fn=collate_fn, num_workers=args.num_workers,
+            drop_last=True, pin_memory=torch.cuda.is_available(),
+        )
 
     # Model
     model = AutoregressiveTransformer(
@@ -176,6 +259,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", type=int, default=200)
     parser.add_argument("--log_every", type=int, default=1000)
     parser.add_argument("--save_every", type=int, default=50000)
+    parser.add_argument("--num_workers", type=int, default=2)
     args = parser.parse_args()
 
     train(args)
