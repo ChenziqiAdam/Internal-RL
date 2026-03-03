@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Sampler
 from typing import List, Optional
 import pickle
+from utils import get_best_device
 
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS
 from data_gen import load_dataset, load_dataset_mmap
@@ -149,7 +150,7 @@ def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
     print(f"Device: {device}, Seed: {args.seed}")
 
     # Load data — use mmap format if data_path is a directory
@@ -189,9 +190,12 @@ def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
     step = 0
     epoch = 0
+    accum_steps = args.grad_accum
 
     while step < args.total_steps:
         epoch += 1
+        optimizer.zero_grad()
+        accum_count = 0
         for obs, acts, subgoals, mask in loader:
             obs = obs.to(device)
             acts = acts.to(device)
@@ -212,13 +216,22 @@ def train(args):
                 target_obs = obs[:, 1:, :]  # (B, T, obs_dim)
                 obs_loss = F.mse_loss(obs_logits[mask], target_obs[mask])
 
-            loss = action_loss + args.lam * obs_loss
-
-            optimizer.zero_grad()
+            loss = (action_loss + args.lam * obs_loss) / accum_steps
             loss.backward()
+            accum_count += 1
+
+            if accum_count < accum_steps:
+                continue
+
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad()
+            accum_count = 0
+
+            # For logging, scale back
+            action_loss = action_loss.detach()
+            obs_loss = obs_loss.detach()
 
             step += 1
             if step % args.log_every == 0:
@@ -252,7 +265,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.03)
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--grad_accum", type=int, default=8,
+                        help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     parser.add_argument("--total_steps", type=int, default=256000)
     parser.add_argument("--lam", type=float, default=0.01,
                         help="Weight for next-obs prediction loss (0 to disable)")

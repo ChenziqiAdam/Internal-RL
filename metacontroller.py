@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS, NUM_ACTIONS
 from train_pretrain import TrajectoryDataset, MmapTrajectoryDataset, BucketSampler, collate_fn
 from data_gen import load_dataset, load_dataset_mmap
+from utils import get_best_device
 from env import OBS_DIM
 
 # Metacontroller hyperparams
@@ -267,7 +268,7 @@ class Metacontroller(nn.Module):
 
 def train_metacontroller(args):
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
     print(f"Device: {device}, Seed: {args.seed}")
 
     # Load frozen base model

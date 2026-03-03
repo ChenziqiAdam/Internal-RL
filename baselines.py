@@ -18,6 +18,7 @@ from model import AutoregressiveTransformer, NUM_ACTIONS
 from internal_rl import InternalRLAgent, grpo_update, CausalPolicy
 from metacontroller import Metacontroller, ControllerDecoder, SwitchingUnit, Z_DIM, GRU_DIM, RANK
 from env import GridworldPinpad, POSTRAIN_TASK, OBS_DIM, MAX_STEPS
+from utils import get_best_device
 
 
 # ── Baseline 1: Raw Action RL (GRPO on token space) ──────────────────────────
@@ -251,7 +252,7 @@ class CompILESegmenter(nn.Module):
 def run_baseline(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
 
     base_ckpt = torch.load(args.base_model_path, map_location=device)
     base_model = AutoregressiveTransformer(predict_obs=True).to(device)

@@ -24,7 +24,9 @@ for seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
         --save_dir $CKPT_DIR/pretrain \
         --seed $seed \
         --lam 0.01 \
-        --total_steps $TOTAL_PRETRAIN_STEPS
+        --total_steps $TOTAL_PRETRAIN_STEPS \
+        --batch_size 128 \
+        --grad_accum 8
 done
 echo "Pretraining done."
 

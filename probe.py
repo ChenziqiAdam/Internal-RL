@@ -16,6 +16,7 @@ from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS
 from train_pretrain import TrajectoryDataset, collate_fn
 from data_gen import load_dataset
 from env import OBS_DIM, NUM_ACTIONS, PRETRAIN_TASKS, POSTRAIN_TASK
+from utils import get_best_device
 
 
 # ── Linear Probe ──────────────────────────────────────────────────────────────
@@ -73,7 +74,7 @@ def train_linear_probe(features: torch.Tensor, labels: torch.Tensor, num_classes
 
 
 def run_linear_probe(model_path: str, data_path: str):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
 
     # Load model
     ckpt = torch.load(model_path, map_location=device)
@@ -167,7 +168,7 @@ def train_supervised_controller(
     lr: float = 1e-3,
     batch_size: int = 256,
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
 
     # Load frozen base model
     ckpt = torch.load(model_path, map_location=device)

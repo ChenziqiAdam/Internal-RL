@@ -17,6 +17,7 @@ from typing import List, Tuple, Optional
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS, NUM_ACTIONS
 from metacontroller import Metacontroller, ControllerDecoder, SwitchingUnit, Z_DIM, GRU_DIM, RANK
 from env import GridworldPinpad, PRETRAIN_TASKS, POSTRAIN_TASK, OBS_DIM, MAX_STEPS
+from utils import get_best_device
 
 
 # ── Causal Policy (replaces acausal embedder in metacontroller) ───────────────
@@ -234,7 +235,7 @@ def grpo_update(
 def train_internal_rl(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
     print(f"Device: {device}, Seed: {args.seed}")
 
     # Load frozen base model
