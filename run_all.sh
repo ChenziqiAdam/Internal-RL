@@ -24,9 +24,8 @@ for seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
         --save_dir $CKPT_DIR/pretrain \
         --seed $seed \
         --lam 0.01 \
-        --total_steps $TOTAL_PRETRAIN_STEPS &
+        --total_steps $TOTAL_PRETRAIN_STEPS
 done
-wait
 echo "Pretraining done."
 
 echo "=== Phase 3 Validation: Linear Probe ==="
@@ -51,10 +50,9 @@ for base_seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
             --save_dir $CKPT_DIR/metacontroller/base${base_seed} \
             --seed $meta_seed \
             --alpha 0.1 \
-            --total_steps $TOTAL_META_STEPS &
+            --total_steps $TOTAL_META_STEPS
     done
 done
-wait
 echo "Metacontroller training done."
 
 echo "=== Phase 6: Internal RL (30 runs) ==="
@@ -65,10 +63,9 @@ for base_seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
             --meta_model_path $CKPT_DIR/metacontroller/base${base_seed}/seed${meta_seed}_step${TOTAL_META_STEPS}.pt \
             --save_dir $CKPT_DIR/internal_rl/base${base_seed}_meta${meta_seed} \
             --seed ${meta_seed} \
-            --total_steps $TOTAL_RL_STEPS &
+            --total_steps $TOTAL_RL_STEPS
     done
 done
-wait
 echo "Internal RL done."
 
 echo "=== Phase 7: Baselines ==="
@@ -77,15 +74,14 @@ for seed in 0 1 2; do
         --baseline raw_action_rl \
         --base_model_path $CKPT_DIR/pretrain/seed${seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
         --save_dir $CKPT_DIR/baselines \
-        --seed $seed &
+        --seed $seed
 
     python baselines.py \
         --baseline no_temporal \
         --base_model_path $CKPT_DIR/pretrain/seed${seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
         --meta_model_path $CKPT_DIR/metacontroller/base${seed}/seed0_step${TOTAL_META_STEPS}.pt \
         --save_dir $CKPT_DIR/baselines \
-        --seed $seed &
+        --seed $seed
 done
-wait
 
 echo "=== All phases complete ==="
