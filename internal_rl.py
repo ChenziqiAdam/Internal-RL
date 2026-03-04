@@ -7,12 +7,22 @@ Phase 6: Internal RL
 """
 
 import os
+import time
 import argparse
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
+
+
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS, NUM_ACTIONS
 from metacontroller import Metacontroller, ControllerDecoder, SwitchingUnit, Z_DIM, GRU_DIM, RANK
@@ -348,7 +358,8 @@ def train_internal_rl(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = get_best_device()
-    print(f"Device: {device}, Seed: {args.seed}")
+    train_start = time.time()
+    print(f"[internal_rl] Device: {device} | Seed: {args.seed} | Steps: {args.total_steps:,} | Episodes/update: {args.episodes_per_update}")
 
     # Load frozen base model
     base_ckpt = torch.load(args.base_model_path, map_location=device)
@@ -366,6 +377,7 @@ def train_internal_rl(args):
     ).to(device)
 
     optimizer = torch.optim.Adam(agent.policy.parameters(), lr=args.lr)
+    print(f"[internal_rl] Policy params: {sum(p.numel() for p in agent.policy.parameters()):,}")
 
     task = POSTRAIN_TASK
     os.makedirs(args.save_dir, exist_ok=True)
@@ -373,6 +385,9 @@ def train_internal_rl(args):
 
     with open(log_path, "w") as f:
         f.write("step,mean_reward,success_rate,policy_loss\n")
+
+    t_last_log = time.time()
+    steps_at_last_log = 0
 
     for step in range(args.total_steps):
         # Collect batch of episodes (batched forward passes)
@@ -382,11 +397,25 @@ def train_internal_rl(args):
         metrics = grpo_update(agent, optimizer, episodes)
 
         if step % 100 == 0:
+            now = time.time()
+            elapsed = now - train_start
+            steps_done = step - steps_at_last_log
+            interval = now - t_last_log
+            steps_per_sec = steps_done / interval if interval > 0 else 0.0
+            remaining_steps = args.total_steps - step
+            eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0.0
+            t_last_log = now
+            steps_at_last_log = step
+            pct = 100.0 * step / args.total_steps
+            avg_ep_len = np.mean([ep["length"] for ep in episodes])
             print(
-                f"Step {step}/{args.total_steps} | "
+                f"[internal_rl] step={step:>6,}/{args.total_steps:,} ({pct:5.1f}%) | "
                 f"success={metrics['success_rate']:.3f} | "
                 f"mean_R={metrics['mean_reward']:.4f} | "
-                f"loss={metrics['policy_loss']:.4f}"
+                f"loss={metrics['policy_loss']:.4f} | "
+                f"ep_len={avg_ep_len:.1f} | "
+                f"{steps_per_sec:.1f} steps/s | "
+                f"elapsed={format_time(elapsed)} | eta={format_time(eta)}"
             )
             with open(log_path, "a") as f:
                 f.write(f"{step},{metrics['mean_reward']:.4f},{metrics['success_rate']:.4f},{metrics['policy_loss']:.4f}\n")
@@ -394,8 +423,10 @@ def train_internal_rl(args):
         if step % 10000 == 0 or step == args.total_steps - 1:
             ckpt_path = os.path.join(args.save_dir, f"seed{args.seed}_step{step}.pt")
             torch.save(agent.policy.state_dict(), ckpt_path)
+            print(f"[internal_rl] Saved checkpoint: {ckpt_path}")
 
-    print("Internal RL training complete.")
+    total_time = time.time() - train_start
+    print(f"[internal_rl] Done. Total time: {format_time(total_time)}")
 
 
 if __name__ == "__main__":

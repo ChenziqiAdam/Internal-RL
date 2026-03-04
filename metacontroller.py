@@ -13,6 +13,7 @@ Training: NLL(next-action) + α * KL(q‖N(0,I)), base model frozen.
 import os
 import argparse
 import math
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -266,10 +267,20 @@ class Metacontroller(nn.Module):
 
 # ── Training ─────────────────────────────────────────────────────────────────
 
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
+
+
 def train_metacontroller(args):
     torch.manual_seed(args.seed)
     device = get_best_device()
-    print(f"Device: {device}, Seed: {args.seed}")
+    train_start = time.time()
+    print(f"[metacontroller] Device: {device} | Seed: {args.seed} | Steps: {args.total_steps:,} | α={args.alpha}")
 
     # Load frozen base model
     ckpt = torch.load(args.model_path, map_location=device)
@@ -278,7 +289,7 @@ def train_metacontroller(args):
 
     model = Metacontroller(base_model).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"Trainable params: {sum(p.numel() for p in trainable):,}")
+    print(f"[metacontroller] Trainable params: {sum(p.numel() for p in trainable):,}")
 
     optimizer = torch.optim.AdamW(trainable, lr=3e-4, weight_decay=0.03)
 
@@ -304,6 +315,8 @@ def train_metacontroller(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
     step = 0
+    t_last_log = time.time()
+    steps_at_last_log = 0
 
     while step < args.total_steps:
         for obs, acts, subgoals, mask in loader:
@@ -330,18 +343,34 @@ def train_metacontroller(args):
 
             step += 1
             if step % 500 == 0:
+                now = time.time()
+                elapsed = now - train_start
+                steps_done = step - steps_at_last_log
+                interval = now - t_last_log
+                steps_per_sec = steps_done / interval if interval > 0 else 0.0
+                remaining_steps = args.total_steps - step
+                eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0.0
+                t_last_log = now
+                steps_at_last_log = step
+                pct = 100.0 * step / args.total_steps
                 avg_beta = beta_seq[mask].mean().item()
-                print(f"Step {step}/{args.total_steps} | nll={nll.item():.4f} | kl={kl.item():.4f} | β̄={avg_beta:.3f}")
+                print(
+                    f"[metacontroller] step={step:>6,}/{args.total_steps:,} ({pct:5.1f}%) | "
+                    f"nll={nll.item():.4f} | kl={kl.item():.4f} | β̄={avg_beta:.3f} | "
+                    f"{steps_per_sec:.1f} steps/s | "
+                    f"elapsed={format_time(elapsed)} | eta={format_time(eta)}"
+                )
 
             if step % 10000 == 0 or step == args.total_steps:
                 ckpt_path = os.path.join(args.save_dir, f"seed{args.seed}_step{step}.pt")
                 torch.save(model.state_dict(), ckpt_path)
-                print(f"Saved: {ckpt_path}")
+                print(f"[metacontroller] Saved checkpoint: {ckpt_path}")
 
             if step >= args.total_steps:
                 break
 
-    print("Metacontroller training complete.")
+    total_time = time.time() - train_start
+    print(f"[metacontroller] Done. Total time: {format_time(total_time)}")
 
 
 if __name__ == "__main__":

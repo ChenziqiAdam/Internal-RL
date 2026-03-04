@@ -7,6 +7,7 @@ Phase 3: Autoregressive Sequence Model Pretraining
 
 import os
 import math
+import time
 import argparse
 import numpy as np
 import torch
@@ -16,6 +17,16 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from typing import List, Optional
 import pickle
 from utils import get_best_device
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds into human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
 from model import AutoregressiveTransformer, TRANSFORMER_DIM, NUM_LAYERS
 from data_gen import load_dataset, load_dataset_mmap
@@ -151,7 +162,8 @@ def train(args):
     np.random.seed(args.seed)
 
     device = get_best_device()
-    print(f"Device: {device}, Seed: {args.seed}")
+    train_start = time.time()
+    print(f"[pretrain] Device: {device} | Seed: {args.seed} | Steps: {args.total_steps:,} | Batch: {args.batch_size}")
 
     # Load data — use mmap format if data_path is a directory
     if os.path.isdir(args.data_path):
@@ -176,7 +188,7 @@ def train(args):
     model = AutoregressiveTransformer(
         predict_obs=(args.lam > 0)
     ).to(device)
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"[pretrain] Model params: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -194,6 +206,8 @@ def train(args):
     step = 0
     epoch = 0
     accum_steps = args.grad_accum
+    t_last_log = time.time()
+    steps_at_last_log = 0
 
     while step < args.total_steps:
         epoch += 1
@@ -242,11 +256,22 @@ def train(args):
 
             step += 1
             if step % args.log_every == 0:
+                now = time.time()
+                elapsed = now - train_start
+                steps_done = step - steps_at_last_log
+                interval = now - t_last_log
+                steps_per_sec = steps_done / interval if interval > 0 else 0.0
+                remaining_steps = args.total_steps - step
+                eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0.0
+                t_last_log = now
+                steps_at_last_log = step
+                pct = 100.0 * step / args.total_steps
                 print(
-                    f"Step {step}/{args.total_steps} | "
-                    f"act_loss={action_loss.item():.4f} | "
-                    f"obs_loss={obs_loss.item():.4f} | "
-                    f"lr={scheduler.get_last_lr()[0]:.2e}"
+                    f"[pretrain] step={step:>7,}/{args.total_steps:,} ({pct:5.1f}%) | "
+                    f"act={action_loss.item():.4f} | obs={obs_loss.item():.4f} | "
+                    f"lr={scheduler.get_last_lr()[0]:.2e} | "
+                    f"{steps_per_sec:.1f} steps/s | "
+                    f"elapsed={format_time(elapsed)} | eta={format_time(eta)}"
                 )
 
             if step % args.save_every == 0 or step == args.total_steps:
@@ -257,12 +282,13 @@ def train(args):
                     "step": step,
                     "args": vars(args),
                 }, ckpt_path)
-                print(f"Saved checkpoint: {ckpt_path}")
+                print(f"[pretrain] Saved checkpoint: {ckpt_path}")
 
             if step >= args.total_steps:
                 break
 
-    print("Pretraining complete.")
+    total_time = time.time() - train_start
+    print(f"[pretrain] Done. Total time: {format_time(total_time)}")
 
 
 if __name__ == "__main__":
