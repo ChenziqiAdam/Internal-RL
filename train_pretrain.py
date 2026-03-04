@@ -265,8 +265,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.03)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--grad_accum", type=int, default=8,
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--grad_accum", type=int, default=1,
                         help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     parser.add_argument("--total_steps", type=int, default=256000)
     parser.add_argument("--lam", type=float, default=0.01,

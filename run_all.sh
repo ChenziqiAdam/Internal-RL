@@ -25,8 +25,8 @@ for seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
         --seed $seed \
         --lam 0.01 \
         --total_steps $TOTAL_PRETRAIN_STEPS \
-        --batch_size 128 \
-        --grad_accum 8
+        --batch_size 1024 \
+        --grad_accum 1
 done
 echo "Pretraining done."
 
