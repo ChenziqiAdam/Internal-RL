@@ -191,6 +191,118 @@ class InternalRLAgent(nn.Module):
             "length": step,
         }
 
+    def rollout_batch(self, task: List[int], n_episodes: int, seeds: List[int]) -> List[dict]:
+        """
+        Run n_episodes simultaneously in a batch for efficiency.
+        Returns list of episode dicts (same interface as rollout_episode).
+        """
+        device = next(self.policy.parameters()).device
+        B = n_episodes
+
+        envs = [GridworldPinpad(task, seed=seeds[i]) for i in range(B)]
+        obs_np = np.stack([env.reset() for env in envs])  # (B, obs_dim)
+
+        # Per-episode storage
+        obs_lists = [[obs_np[i].copy()] for i in range(B)]
+        action_lists = [[] for _ in range(B)]
+        log_prob_lists = [[] for _ in range(B)]
+        z_lists = [[] for _ in range(B)]
+        beta_lists = [[] for _ in range(B)]
+        total_rewards = [0.0] * B
+        steps = [0] * B
+
+        # Batch policy state
+        h = self.policy.init_hidden(B, device)           # (B, hidden_dim)
+        z_prev = torch.zeros(B, self.z_dim, device=device)   # (B, z_dim)
+        switch_h = torch.zeros(B, GRU_DIM, device=device)    # (B, GRU_DIM)
+
+        active = torch.ones(B, dtype=torch.bool, device=device)  # alive episodes
+
+        while active.any():
+            # Build batch obs: (B, 2, obs_dim) — only need current obs
+            obs_tensor = torch.tensor(obs_np, dtype=torch.float32, device=device)  # (B, obs_dim)
+            obs_pair = torch.zeros(B, 2, obs_np.shape[1], device=device)
+            obs_pair[:, 0] = obs_tensor
+            dummy_act = torch.zeros(B, 1, dtype=torch.long, device=device)
+
+            # Transformer embedding up to insert_layer (batched, no grad)
+            with torch.no_grad():
+                with torch.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
+                    tokens, _ = self.base.embed_sequence(obs_pair, dummy_act)
+                    x = tokens
+                    for layer_idx, layer in enumerate(self.base.layers):
+                        x = layer(x)
+                        if layer_idx == self.insert_layer:
+                            e_t = x[:, 0, :]  # (B, dim)
+                            break
+
+            # Causal policy (only active episodes matter, but run full batch)
+            mu, logvar, h_new = self.policy(e_t, h)
+            std = (0.5 * logvar).exp()
+            eps = torch.randn_like(mu)
+            z_tilde = mu + std * eps
+
+            # Switching unit
+            beta = self.switch(e_t, switch_h, z_prev)   # (B, 1)
+            beta_hard = (beta > 0.5).float()
+            z_t = beta_hard * z_tilde + (1 - beta_hard) * z_prev
+
+            # Decode controller + get action logits
+            with torch.no_grad():
+                U = self.decoder(z_t)  # (B, dim, dim)
+
+            e_perturbed = e_t + torch.bmm(U, e_t.unsqueeze(-1)).squeeze(-1)
+
+            with torch.no_grad():
+                action_logits = self.base.action_head(e_perturbed)  # (B, num_actions)
+
+            action_probs = F.softmax(action_logits, dim=-1)
+            dist = torch.distributions.Categorical(action_probs)
+            actions = dist.sample()         # (B,)
+            log_probs = dist.log_prob(actions)  # (B,)
+
+            # Step each active env
+            new_obs_np = obs_np.copy()
+            for i in range(B):
+                if not active[i]:
+                    continue
+                a = actions[i].item()
+                obs_new, reward, done, _ = envs[i].step(a)
+                new_obs_np[i] = obs_new
+                obs_lists[i].append(obs_new.copy())
+                action_lists[i].append(a)
+                log_prob_lists[i].append(log_probs[i])
+                z_lists[i].append(z_t[i].detach())
+                beta_lists[i].append(beta_hard[i].detach())
+                total_rewards[i] += reward
+                steps[i] += 1
+                if done or steps[i] >= MAX_STEPS:
+                    active[i] = False
+
+            obs_np = new_obs_np
+            # Update states; mask out done episodes to stop gradient drift
+            active_f = active.float().unsqueeze(1)
+            h = h_new * active_f + h.detach() * (1 - active_f)
+            z_prev = z_t.detach()
+            # switch_h is updated inside SwitchingUnit — re-fetch from switch if needed
+            # (switch_h is stateless input; beta already computed; no update needed here)
+
+        episodes = []
+        for i in range(B):
+            lp = log_prob_lists[i]
+            zs = z_lists[i]
+            bs = beta_lists[i]
+            episodes.append({
+                "obs": obs_lists[i],
+                "actions": action_lists[i],
+                "log_probs": torch.stack(lp) if lp else torch.tensor([]),
+                "z_seq": torch.stack(zs) if zs else torch.zeros(0, self.z_dim, device=device),
+                "beta_seq": torch.stack(bs) if bs else torch.zeros(0, 1, device=device),
+                "reward": total_rewards[i],
+                "length": steps[i],
+            })
+        return episodes
+
 
 # ── GRPO Training ─────────────────────────────────────────────────────────────
 
@@ -263,12 +375,9 @@ def train_internal_rl(args):
         f.write("step,mean_reward,success_rate,policy_loss\n")
 
     for step in range(args.total_steps):
-        # Collect batch of episodes
-        episodes = []
-        for _ in range(args.episodes_per_update):
-            ep_seed = np.random.randint(0, 2**31)
-            ep = agent.rollout_episode(task, seed=ep_seed)
-            episodes.append(ep)
+        # Collect batch of episodes (batched forward passes)
+        seeds = [int(np.random.randint(0, 2**31)) for _ in range(args.episodes_per_update)]
+        episodes = agent.rollout_batch(task, args.episodes_per_update, seeds)
 
         metrics = grpo_update(agent, optimizer, episodes)
 

@@ -182,6 +182,9 @@ def train(args):
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     # Cosine LR schedule
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.total_steps
@@ -201,30 +204,34 @@ def train(args):
             acts = acts.to(device)
             mask = mask.to(device)
 
-            action_logits, obs_logits, _ = model(obs, acts)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                action_logits, obs_logits, _ = model(obs, acts)
 
-            # Action loss (masked)
-            B, T, _ = action_logits.shape
-            action_loss = F.cross_entropy(
-                action_logits[mask], acts[mask]
-            )
+                # Action loss (masked)
+                B, T, _ = action_logits.shape
+                action_loss = F.cross_entropy(
+                    action_logits[mask], acts[mask]
+                )
 
-            # Observation prediction loss
-            obs_loss = torch.tensor(0.0, device=device)
-            if args.lam > 0 and obs_logits is not None:
-                # obs_logits: (B, T, obs_dim) predicts obs_{t+1}
-                target_obs = obs[:, 1:, :]  # (B, T, obs_dim)
-                obs_loss = F.mse_loss(obs_logits[mask], target_obs[mask])
+                # Observation prediction loss
+                obs_loss = torch.tensor(0.0, device=device)
+                if args.lam > 0 and obs_logits is not None:
+                    # obs_logits: (B, T, obs_dim) predicts obs_{t+1}
+                    target_obs = obs[:, 1:, :]  # (B, T, obs_dim)
+                    obs_loss = F.mse_loss(obs_logits[mask], target_obs[mask])
 
-            loss = (action_loss + args.lam * obs_loss) / accum_steps
-            loss.backward()
+                loss = (action_loss + args.lam * obs_loss) / accum_steps
+
+            scaler.scale(loss).backward()
             accum_count += 1
 
             if accum_count < accum_steps:
                 continue
 
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
             accum_count = 0

@@ -282,6 +282,9 @@ def train_metacontroller(args):
 
     optimizer = torch.optim.AdamW(trainable, lr=3e-4, weight_decay=0.03)
 
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     if os.path.isdir(args.data_path):
         dataset = load_dataset_mmap(args.data_path)
         ds = MmapTrajectoryDataset(dataset)
@@ -306,21 +309,24 @@ def train_metacontroller(args):
         for obs, acts, subgoals, mask in loader:
             obs, acts, mask = obs.to(device), acts.to(device), mask.to(device)
 
-            action_logits, mu_seq, logvar_seq, beta_seq, z_seq = model(obs, acts)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                action_logits, mu_seq, logvar_seq, beta_seq, z_seq = model(obs, acts)
 
-            # NLL loss
-            nll = F.cross_entropy(action_logits[mask], acts[mask])
+                # NLL loss
+                nll = F.cross_entropy(action_logits[mask], acts[mask])
 
-            # KL divergence: KL(N(mu, sigma) || N(0, I))
-            kl = -0.5 * (1 + logvar_seq - mu_seq.pow(2) - logvar_seq.exp())
-            kl = kl[mask].mean()
+                # KL divergence: KL(N(mu, sigma) || N(0, I))
+                kl = -0.5 * (1 + logvar_seq - mu_seq.pow(2) - logvar_seq.exp())
+                kl = kl[mask].mean()
 
-            loss = nll + args.alpha * kl
+                loss = nll + args.alpha * kl
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(trainable, 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             step += 1
             if step % 500 == 0:
