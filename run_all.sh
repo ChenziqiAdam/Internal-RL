@@ -21,19 +21,60 @@ echo "Using $N_GPUS GPU(s) for parallelism"
 # Minimum free GPU memory required to launch a job (in MiB)
 MIN_FREE_MiB=4000
 
-# Pick a GPU with >= MIN_FREE_MiB free memory; waits until one is available.
-# Prints the GPU index to stdout.
+# Maximum concurrent jobs per GPU (each pretrain job uses ~2-3 GB)
+MAX_JOBS_PER_GPU=2
+
+# Track running jobs per GPU using a temp directory for lock files
+GPU_SLOTS_DIR=$(mktemp -d)
+trap "rm -rf $GPU_SLOTS_DIR" EXIT
+
+# Pick a GPU with enough free memory AND fewer than MAX_JOBS_PER_GPU running jobs.
+# Waits until a slot is available. Prints the GPU index to stdout.
 pick_gpu() {
     while true; do
-        gpu=$(nvidia-smi --query-gpu=index,memory.free \
-                --format=csv,noheader,nounits 2>/dev/null \
-              | awk -F', ' -v min="$MIN_FREE_MiB" '$2 >= min {print $1; exit}')
-        if [ -n "$gpu" ]; then
-            echo "$gpu"
-            return
-        fi
-        sleep 10
+        # Read GPU info: index and free memory
+        while IFS=', ' read -r idx free_mem; do
+            # Count current running jobs on this GPU
+            local running=$(ls "$GPU_SLOTS_DIR"/gpu_${idx}_* 2>/dev/null | wc -l)
+            if [ "$running" -lt "$MAX_JOBS_PER_GPU" ] && [ "$free_mem" -ge "$MIN_FREE_MiB" ]; then
+                echo "$idx"
+                return
+            fi
+        done < <(nvidia-smi --query-gpu=index,memory.free \
+                    --format=csv,noheader,nounits 2>/dev/null)
+        sleep 5
     done
+}
+
+# Register a job on a GPU (call after pick_gpu, before launching)
+register_gpu_job() {
+    local gpu=$1
+    local pid=$2
+    touch "$GPU_SLOTS_DIR/gpu_${gpu}_${pid}"
+}
+
+# Clean up finished GPU job slots (call periodically)
+cleanup_gpu_slots() {
+    for f in "$GPU_SLOTS_DIR"/gpu_*; do
+        [ -e "$f" ] || continue
+        local pid=$(basename "$f" | sed 's/gpu_[0-9]*_//')
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$f"
+        fi
+    done
+}
+
+# Launch a job on the best available GPU. Usage: launch_on_gpu <command...>
+# Sets CUDA_VISIBLE_DEVICES and tracks the slot.
+launch_on_gpu() {
+    cleanup_gpu_slots
+    local gpu=$(pick_gpu)
+    CUDA_VISIBLE_DEVICES=$gpu "$@" &
+    local pid=$!
+    register_gpu_job "$gpu" "$pid"
+    echo "$gpu"
+    # Small delay so nvidia-smi can see the allocation before next pick
+    sleep 2
 }
 
 echo "=== Phase 1+2: Generate Expert Data ==="
@@ -42,16 +83,15 @@ python data_gen.py --split posttrain --n_episodes 1000 --out_dir $DATA_DIR
 
 echo "=== Phase 3: Pretrain Transformer (10 seeds) ==="
 for seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
-    gpu=$(pick_gpu)
-    echo "  seed=$seed -> GPU $gpu"
-    CUDA_VISIBLE_DEVICES=$gpu python train_pretrain.py \
+    gpu=$(launch_on_gpu python train_pretrain.py \
         --data_path $DATA_DIR/pretrain.pkl \
         --save_dir $CKPT_DIR/pretrain \
         --seed $seed \
         --lam 0.01 \
         --total_steps $TOTAL_PRETRAIN_STEPS \
         --batch_size 1024 \
-        --grad_accum 1 &
+        --grad_accum 1)
+    echo "  seed=$seed -> GPU $gpu"
 done
 wait
 echo "Pretraining done."
@@ -72,15 +112,14 @@ python probe.py \
 echo "=== Phase 5: Metacontroller (3 seeds × 10 pretrained) ==="
 for base_seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
     for meta_seed in $(seq 0 $((N_META_SEEDS - 1))); do
-        gpu=$(pick_gpu)
-        echo "  base=$base_seed meta=$meta_seed -> GPU $gpu"
-        CUDA_VISIBLE_DEVICES=$gpu python metacontroller.py \
+        gpu=$(launch_on_gpu python metacontroller.py \
             --model_path $CKPT_DIR/pretrain/seed${base_seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
             --data_path $DATA_DIR/pretrain.pkl \
             --save_dir $CKPT_DIR/metacontroller/base${base_seed} \
             --seed $meta_seed \
             --alpha 0.1 \
-            --total_steps $TOTAL_META_STEPS &
+            --total_steps $TOTAL_META_STEPS)
+        echo "  base=$base_seed meta=$meta_seed -> GPU $gpu"
     done
 done
 wait
@@ -89,14 +128,13 @@ echo "Metacontroller training done."
 echo "=== Phase 6: Internal RL (30 runs) ==="
 for base_seed in $(seq 0 $((N_PRETRAIN_SEEDS - 1))); do
     for meta_seed in $(seq 0 $((N_META_SEEDS - 1))); do
-        gpu=$(pick_gpu)
-        echo "  base=$base_seed meta=$meta_seed -> GPU $gpu"
-        CUDA_VISIBLE_DEVICES=$gpu python internal_rl.py \
+        gpu=$(launch_on_gpu python internal_rl.py \
             --base_model_path $CKPT_DIR/pretrain/seed${base_seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
             --meta_model_path $CKPT_DIR/metacontroller/base${base_seed}/seed${meta_seed}_step${TOTAL_META_STEPS}.pt \
             --save_dir $CKPT_DIR/internal_rl/base${base_seed}_meta${meta_seed} \
             --seed ${meta_seed} \
-            --total_steps $TOTAL_RL_STEPS &
+            --total_steps $TOTAL_RL_STEPS)
+        echo "  base=$base_seed meta=$meta_seed -> GPU $gpu"
     done
 done
 wait
@@ -104,22 +142,20 @@ echo "Internal RL done."
 
 echo "=== Phase 7: Baselines ==="
 for seed in 0 1 2; do
-    gpu=$(pick_gpu)
-    echo "  raw_action_rl seed=$seed -> GPU $gpu"
-    CUDA_VISIBLE_DEVICES=$gpu python baselines.py \
+    gpu=$(launch_on_gpu python baselines.py \
         --baseline raw_action_rl \
         --base_model_path $CKPT_DIR/pretrain/seed${seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
         --save_dir $CKPT_DIR/baselines \
-        --seed $seed &
+        --seed $seed)
+    echo "  raw_action_rl seed=$seed -> GPU $gpu"
 
-    gpu=$(pick_gpu)
-    echo "  no_temporal seed=$seed -> GPU $gpu"
-    CUDA_VISIBLE_DEVICES=$gpu python baselines.py \
+    gpu=$(launch_on_gpu python baselines.py \
         --baseline no_temporal \
         --base_model_path $CKPT_DIR/pretrain/seed${seed}_step${TOTAL_PRETRAIN_STEPS}.pt \
         --meta_model_path $CKPT_DIR/metacontroller/base${seed}/seed0_step${TOTAL_META_STEPS}.pt \
         --save_dir $CKPT_DIR/baselines \
-        --seed $seed &
+        --seed $seed)
+    echo "  no_temporal seed=$seed -> GPU $gpu"
 done
 wait
 
